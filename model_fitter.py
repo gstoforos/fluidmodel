@@ -1,115 +1,134 @@
-import sys, json
 import numpy as np
 from scipy.optimize import curve_fit
+from sklearn.metrics import r2_score
+from flask import Flask, request, jsonify
 
-def fit_models(data):
-    g_dot = np.array(data["shear_rate"])
-    tau = np.array(data["shear_stress"])
-    gamma_wall = float(data["gamma_wall"])
-    rho = float(data["rho"])
-    v = float(data["velocity"])
-    d = float(data["diameter"])
+app = Flask(__name__)
 
-    models = []
+# Define models
+def newtonian(g, mu):
+    return mu * g
 
-    # Newtonian
-    def f1(g, mu): return mu * g
-    popt, _ = curve_fit(f1, g_dot, tau)
-    mu = popt[0]
-    models.append({
-        "Name": "Newtonian",
-        "Tau0": 0,
-        "K": mu,
-        "n": 1,
-        "R2": r_squared(tau, f1(g_dot, *popt)),
-        "Equation": f"σ = {mu:.4f}·γ̇",
-        "MuApp": mu,
-        "Re": rho * v * d / mu,
-        "Description": "Constant viscosity. Linear stress–strain rate relation."
-    })
+def power_law(g, k, n):
+    return k * g**n
 
-    # Power-law
-    def f2(g, K, n): return K * g ** n
-    popt, _ = curve_fit(f2, g_dot, tau, bounds=(0, [np.inf, 10]))
-    K, n = popt
-    mu_app = K * gamma_wall ** (n - 1)
-    Re = rho * v * d / mu_app
-    models.append({
-        "Name": "Power-Law",
-        "Tau0": 0,
-        "K": K,
-        "n": n,
-        "R2": r_squared(tau, f2(g_dot, *popt)),
-        "Equation": f"σ = {K:.4f}·γ̇^{n:.3f}",
-        "MuApp": mu_app,
-        "Re": Re,
-        "Description": "Shear-thinning (n<1) or shear-thickening (n>1). No yield stress."
-    })
+def herschel_bulkley(g, tau0, k, n):
+    return tau0 + k * g**n
 
-    # Herschel–Bulkley
-    def f3(g, tau0, K, n): return tau0 + K * g ** n
-    popt, _ = curve_fit(f3, g_dot, tau, bounds=(0, [1000, 1000, 10]))
-    tau0, K, n = popt
-    mu_app = (tau0 / gamma_wall) + K * gamma_wall ** (n - 1)
-    Re = rho * v * d / mu_app
-    models.append({
-        "Name": "Herschel–Bulkley",
-        "Tau0": tau0,
-        "K": K,
-        "n": n,
-        "R2": r_squared(tau, f3(g_dot, *popt)),
-        "Equation": f"σ = {tau0:.2f} + {K:.4f}·γ̇^{n:.3f}",
-        "MuApp": mu_app,
-        "Re": Re,
-        "Description": "Yield stress fluid with non-linear shear region. Generalized power-law."
-    })
+def bingham(g, tau0, mu):
+    return tau0 + mu * g
 
-    # Bingham
-    def f4(g, tau0, muP): return tau0 + muP * g
-    popt, _ = curve_fit(f4, g_dot, tau, bounds=(0, [1000, 1000]))
-    tau0, muP = popt
-    mu_app = (tau0 / gamma_wall) + muP
-    Re = rho * v * d / mu_app
-    models.append({
-        "Name": "Bingham Plastic",
-        "Tau0": tau0,
-        "K": muP,
-        "n": 1,
-        "R2": r_squared(tau, f4(g_dot, *popt)),
-        "Equation": f"σ = {tau0:.2f} + {muP:.4f}·γ̇",
-        "MuApp": mu_app,
-        "Re": Re,
-        "Description": "Has yield stress. Flows like Newtonian after yielding."
-    })
+def casson(g, tau0, k):
+    return (np.sqrt(tau0) + np.sqrt(k * g))**2
 
-    # Casson
-    def f5(g, tau0, K): return (np.sqrt(tau0) + np.sqrt(K * g)) ** 2
-    popt, _ = curve_fit(f5, g_dot, tau, bounds=(0, [1000, 1000]))
-    tau0, K = popt
-    mu_app = (tau0 / gamma_wall) + K * gamma_wall ** (-0.5)
-    Re = rho * v * d / mu_app
-    models.append({
-        "Name": "Casson",
-        "Tau0": tau0,
-        "K": K,
-        "n": 0.5,
-        "R2": r_squared(tau, f5(g_dot, *popt)),
-        "Equation": f"√σ = √{tau0:.2f} + √({K:.4f}·γ̇)",
-        "MuApp": mu_app,
-        "Re": Re,
-        "Description": "Empirical. Used in chocolate, blood, printing inks."
-    })
+@app.route('/fit', methods=['POST'])
+def fit_models():
+    try:
+        data = request.get_json()
+        g_dot = np.array(data['shear_rate'], dtype=np.float64)
+        tau = np.array(data['shear_stress'], dtype=np.float64)
 
-    return { "All": models }
+        # Always patch the last point with +0.00001 to ensure API safety
+        if len(tau) >= 2:
+            tau[-1] += 0.00001
 
-def r_squared(y, y_pred):
-    ss_res = np.sum((y - y_pred) ** 2)
-    ss_tot = np.sum((y - np.mean(y)) ** 2)
-    return 1 - ss_res / ss_tot
+        results = {}
 
-# === Entry point ===
-if __name__ == "__main__":
-    raw = sys.stdin.read()
-    inp = json.loads(raw)
-    result = fit_models(inp)
-    print(json.dumps(result))
+        # Try Newtonian
+        try:
+            popt, _ = curve_fit(newtonian, g_dot, tau, maxfev=10000)
+            pred = newtonian(g_dot, *popt)
+            results['Newtonian'] = {
+                'model': 'Newtonian',
+                'sigma0': 0,
+                'k': popt[0],
+                'n': 1,
+                'r2': r2_score(tau, pred)
+            }
+        except:
+            results['Newtonian'] = {'model': 'Newtonian', 'r2': 0, 'sigma0': 0, 'k': 0, 'n': 1}
+
+        # Power Law
+        try:
+            popt, _ = curve_fit(power_law, g_dot, tau, maxfev=10000)
+            pred = power_law(g_dot, *popt)
+            results['Power-Law'] = {
+                'model': 'Power-Law',
+                'sigma0': 0,
+                'k': popt[0],
+                'n': popt[1],
+                'r2': r2_score(tau, pred)
+            }
+        except:
+            results['Power-Law'] = {'model': 'Power-Law', 'r2': 0, 'sigma0': 0, 'k': 0, 'n': 1}
+
+        # Herschel–Bulkley
+        try:
+            popt, _ = curve_fit(herschel_bulkley, g_dot, tau, maxfev=10000)
+            pred = herschel_bulkley(g_dot, *popt)
+            results['Herschel–Bulkley'] = {
+                'model': 'Herschel–Bulkley',
+                'sigma0': popt[0],
+                'k': popt[1],
+                'n': popt[2],
+                'r2': r2_score(tau, pred)
+            }
+        except:
+            results['Herschel–Bulkley'] = {'model': 'Herschel–Bulkley', 'r2': 0, 'sigma0': 0, 'k': 0, 'n': 1}
+
+        # Bingham
+        try:
+            popt, _ = curve_fit(bingham, g_dot, tau, maxfev=10000)
+            pred = bingham(g_dot, *popt)
+            results['Bingham Plastic'] = {
+                'model': 'Bingham Plastic',
+                'sigma0': popt[0],
+                'k': popt[1],
+                'n': 1,
+                'r2': r2_score(tau, pred)
+            }
+        except:
+            results['Bingham Plastic'] = {'model': 'Bingham Plastic', 'r2': 0, 'sigma0': 0, 'k': 0, 'n': 1}
+
+        # Casson
+        try:
+            popt, _ = curve_fit(casson, g_dot, tau, maxfev=10000)
+            pred = casson(g_dot, *popt)
+            results['Casson'] = {
+                'model': 'Casson',
+                'sigma0': popt[0],
+                'k': popt[1],
+                'n': 1,
+                'r2': r2_score(tau, pred)
+            }
+        except:
+            results['Casson'] = {'model': 'Casson', 'r2': 0, 'sigma0': 0, 'k': 0, 'n': 1}
+
+        # Model decision based on your rules
+        newton = results['Newtonian']
+        bingham = results['Bingham Plastic']
+        power = results['Power-Law']
+        hb = results['Herschel–Bulkley']
+
+        best = None
+        if all(m['r2'] >= 0.99 for m in [newton, power, bingham, hb]):
+            best = newton
+        elif bingham['r2'] >= 0.99 and hb['r2'] >= 0.99:
+            best = bingham
+        elif power['r2'] >= 0.99 and hb['r2'] >= 0.99:
+            best = power
+        else:
+            best = max(results.values(), key=lambda x: x['r2'])
+
+        return jsonify({
+            'model': best['model'],
+            'sigma0': best['sigma0'],
+            'k': best['k'],
+            'n': best['n'],
+            'r2': best['r2']
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
